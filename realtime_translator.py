@@ -143,6 +143,8 @@ def bootstrap_venv():
 bootstrap_venv()
 
 # now we can import the heavy deps
+import re  # noqa: E402
+from collections import deque  # noqa: E402
 import numpy as np  # noqa: E402
 import sounddevice as sd  # noqa: E402
 import webrtcvad  # noqa: E402  (P2 — VAD for sentence-boundary chunking)
@@ -794,6 +796,35 @@ def test_capture():
 # Audio preprocessing — P2: denoise + VAD
 # ============================================================
 
+_vad_instance = None
+
+def _get_vad():
+    global _vad_instance
+    if _vad_instance is None:
+        _vad_instance = webrtcvad.Vad(VAD_AGGR)
+    return _vad_instance
+
+
+def is_frame_speech(vad, frame_f32, sr=SAMPLERATE):
+    """Run webrtcvad on sub-frames of frame_f32.
+    Returns True if at least 30% of the sub-frames contain speech."""
+    try:
+        pcm16 = (np.clip(frame_f32, -1, 1) * 32767).astype(np.int16).tobytes()
+        subframe_samples = int(sr * 0.030)  # 30 ms = 480 samples
+        subframe_bytes = subframe_samples * 2  # 16-bit PCM has 2 bytes per sample = 960 bytes
+        n_subframes = len(pcm16) // subframe_bytes
+        if n_subframes == 0:
+            return False
+        speech_count = 0
+        for i in range(n_subframes):
+            subframe = pcm16[i * subframe_bytes:(i + 1) * subframe_bytes]
+            if vad.is_speech(subframe, sr):
+                speech_count += 1
+        return (speech_count / n_subframes) >= 0.30
+    except Exception:
+        return True  # fail open
+
+
 def denoise_chunk(audio_f32, sr=SAMPLERATE):
     """Apply noisereduce to a float32 audio chunk. Always-on (no toggle).
     Skips silently short or near-silent audio to avoid scipy UserWarning."""
@@ -807,8 +838,8 @@ def denoise_chunk(audio_f32, sr=SAMPLERATE):
         import warnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            return nr.reduce_noise(y=audio_f32.astype(np.float64),
-                                   sr=sr, **DENOISE_PROPS).astype(np.float32)
+            # Pass float32 numpy array directly without casting to float64 and back!
+            return nr.reduce_noise(y=audio_f32, sr=sr, **DENOISE_PROPS)
     except Exception:
         return audio_f32
 
@@ -819,7 +850,7 @@ def has_speech(audio_f32, sr=SAMPLERATE):
     if audio_f32 is None or len(audio_f32) < sr // 4:
         return False, 0.0
     try:
-        vad = webrtcvad.Vad(VAD_AGGR)
+        vad = _get_vad()
         # webrtcvad needs 16-bit PCM at 8k/16k/32k/48k, frame sizes 10/20/30 ms
         pcm16 = (np.clip(audio_f32, -1, 1) * 32767).astype(np.int16).tobytes()
         frame_bytes = int(sr * VAD_FRAME_MS / 1000) * 2  # 2 bytes per sample
@@ -1008,7 +1039,6 @@ def _strip_hallucinations(text):
         return text
     for tag in HALLUC_TAGS:
         text = text.replace(tag, "")
-    import re
     text = re.sub(SUPPRESS_REGEX, "", text)
     text = "\n".join(
         ln for ln in text.splitlines()
@@ -1082,9 +1112,11 @@ def _hf_repo_to_local_path(hf_repo):
         return None
 
 
-def transcribe_mlx(wav_path, lang, prompt):
+def transcribe_mlx(audio_input, lang, prompt):
     """MLX-Whisper backend (in-process, uses ANE — requires mlx_whisper installed).
-    Falls back to None if not available; caller should fall back to CLI."""
+    Falls back to None if not available; caller should fall back to CLI.
+    `audio_input` can be a path to a wav file or a numpy float32 array.
+    """
     with _state_lock:
         use_mlx = state.get("use_mlx_whisper", True)
     if not HAS_MLX_WHISPER or not use_mlx:
@@ -1114,7 +1146,7 @@ def transcribe_mlx(wav_path, lang, prompt):
 
     try:
         result = mlx_whisper.transcribe(
-            wav_path,
+            audio_input,
             path_or_hf_repo=mlx_repo,
             language=lang if lang != "auto" else None,
             initial_prompt=prompt,
@@ -1141,13 +1173,20 @@ def transcribe_mlx(wav_path, lang, prompt):
         return None
 
 
-def transcribe(wav_path, lang):
-    """Top-level STT — tries MLX-Whisper first (faster), then whisper.cpp CLI."""
+def transcribe(audio_f32, wav_path, lang):
+    """Top-level STT — tries MLX-Whisper first (faster) with NumPy array directly,
+    falls back to whisper.cpp CLI (writing WAV to disk only on fallback)."""
     prompt = get_whisper_prompt(_current_src_lang())
-    # Try MLX first if installed; fall back to CLI on any failure
-    text = transcribe_mlx(wav_path, lang, prompt)
+    # Try MLX first if installed (with in-memory numpy array, no disk write)
+    text = transcribe_mlx(audio_f32, lang, prompt)
     if text is None:
+        # Fallback to CLI: must write to disk
+        save_wav(wav_path, audio_f32)
         text = transcribe_cli(wav_path, lang, prompt)
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
     return text
 
 
@@ -1323,7 +1362,6 @@ def translate_text(text, model, src, tgt, history=None):
             result = result.replace(token, "")
         result = result.strip()
         if tgt == "Thai":
-            import re
             result = re.sub(r'([ะัาิีึืุู็่้๊๋์ๆ])\1+', r'\1', result)
 
     # P2 — validate, retry once with stricter prompt
@@ -1341,7 +1379,6 @@ def translate_text(text, model, src, tgt, history=None):
                     retry = retry.replace(token, "")
                 retry = retry.strip()
                 if tgt == "Thai":
-                    import re
                     retry = re.sub(r'([ะัาิีึืุู็่้๊๋์ๆ])\1+', r'\1', retry)
                 
                 ok2, _ = validate_translation(text, retry, src, tgt)
@@ -1358,16 +1395,39 @@ def translate_text(text, model, src, tgt, history=None):
 # ============================================================
 
 def audio_thread():
-    """Open BlackHole stream, apply denoise + VAD, push cleaned chunks to audio_q.
-    P2: overlap window (CHUNK_OVERLAP seconds of previous audio kept as prefix)."""
-    overlap_samples = int(SAMPLERATE * CHUNK_OVERLAP)
+    """Open BlackHole stream, track speech/silence dynamically, push cleaned chunks to audio_q.
+    Updates the level meter in real-time (every 100ms) for smoother UI response."""
+    vad = _get_vad()
+    frame_duration = 0.1  # 100ms blocks
+    frame_samples = int(SAMPLERATE * frame_duration)
+    
+    # Configuration parameters
+    max_speech_duration = 5.0  # seconds (max chunk length)
+    silence_threshold = 0.8  # seconds (silence after speech to trigger slice)
+    
+    pre_roll_buffer = deque(maxlen=5)  # store last 0.5s of silence
+    accumulated_chunks = []
+    
+    is_speaking = False
+    speech_time = 0.0
+    silence_time = 0.0
+    continuous_silent_samples = 0
+    last_silent_warn_ts = 0.0
+    
     while True:
         with _state_lock:
             listening = state["listening"]
             device_name = state["device"]
         if not listening:
+            pre_roll_buffer.clear()
+            accumulated_chunks.clear()
+            is_speaking = False
+            speech_time = 0.0
+            silence_time = 0.0
+            continuous_silent_samples = 0
             time.sleep(0.2)
             continue
+            
         dev_index = find_device(device_name)
         if dev_index is None:
             broadcast("error", {"msg": f"Input device '{device_name}' not found"})
@@ -1376,81 +1436,92 @@ def audio_thread():
             broadcast("state", _public_state())
             time.sleep(1)
             continue
+            
         try:
             with sd.InputStream(device=dev_index, channels=CHANNELS,
                                 samplerate=SAMPLERATE, dtype="float32") as stream:
-                broadcast("info", {"msg": f"🎧 Capturing from {device_name} (VAD + denoise)"})
+                broadcast("info", {"msg": f"🎧 Capturing from {device_name} (dynamic VAD + denoise)"})
                 # clear backlog
                 for q in (audio_q, llm_q):
                     while not q.empty():
                         try: q.get_nowait()
                         except: break
-                prev_tail = np.zeros(0, dtype=np.float32)
-                # Track consecutive silent chunks so we can warn the user if
-                # BlackHole / system audio routing is misconfigured.
-                silent_chunks = 0
-                last_silent_warn_ts = 0.0
+                        
                 while True:
                     with _state_lock:
                         if not state["listening"]:
                             break
-                    chunk, _ = stream.read(int(SAMPLERATE * CHUNK_DURATION))
-                    # P2 — denoise
-                    chunk_clean = denoise_chunk(chunk)
-                    # level meter uses original (denoise suppresses everything → wrong meter)
-                    vol = float(np.linalg.norm(chunk) / np.sqrt(len(chunk)))
+                            
+                    block, _ = stream.read(frame_samples)
+                    is_speech = is_frame_speech(vad, block)
+                    
+                    # Level meter calculation (updated smoothly every 100ms)
+                    vol = float(np.linalg.norm(block) / np.sqrt(len(block)))
                     vol = min(1.0, vol * 5)
                     with _state_lock:
                         state["level"] = vol
                     broadcast("level", {"v": vol})
-
-                    # ── Detect silent-input bug ────────────────────────────
-                    # If we got 3+ consecutive 5-second chunks with peak < 0.001,
-                    # BlackHole is capturing silence — system audio isn't routed.
-                    raw_peak = float(np.abs(chunk).max())
+                    
+                    # Detect silent-input bug: system audio routing issue
+                    raw_peak = float(np.abs(block).max())
                     if raw_peak < 0.001:
-                        silent_chunks += 1
-                        now = time.time()
-                        # First warn after 15s, then every 30s
-                        if silent_chunks >= 3 and (now - last_silent_warn_ts) > 30:
-                            broadcast("error", {
-                                "msg": f"🔇 No audio input on {device_name} — system audio "
-                                       f"isn't routed here. Set '{device_name}' as the OUTPUT "
-                                       f"in the source app (Teams/Zoom/browser), or create a "
-                                       f"Multi-Output Device in Audio MIDI Setup that sends to "
-                                       f"both your speakers and {device_name}."
-                            })
-                            last_silent_warn_ts = now
+                        continuous_silent_samples += len(block)
+                        if continuous_silent_samples >= SAMPLERATE * 15:  # 15s of silence
+                            now = time.time()
+                            if now - last_silent_warn_ts > 30:
+                                broadcast("error", {
+                                    "msg": f"🔇 No audio input on {device_name} — system audio "
+                                           f"isn't routed here. Set '{device_name}' as the OUTPUT "
+                                           f"in the source app (Teams/Zoom/browser), or create a "
+                                           f"Multi-Output Device in Audio MIDI Setup that sends to "
+                                           f"both your speakers and {device_name}."
+                                })
+                                last_silent_warn_ts = now
+                            continuous_silent_samples = SAMPLERATE * 15  # cap
                     else:
-                        silent_chunks = 0
-                    # ───────────────────────────────────────────────────────
-
-                    # P2 — overlap with previous chunk's tail
-                    if overlap_samples > 0 and len(prev_tail) > 0:
-                        full = np.concatenate([prev_tail, chunk_clean])
+                        continuous_silent_samples = 0
+                        
+                    # Dynamic VAD slicing state machine
+                    if is_speech:
+                        if not is_speaking:
+                            is_speaking = True
+                            accumulated_chunks = list(pre_roll_buffer)
+                            pre_roll_buffer.clear()
+                            speech_time = len(accumulated_chunks) * frame_duration
+                            silence_time = 0.0
+                        
+                        accumulated_chunks.append(block)
+                        speech_time += frame_duration
+                        silence_time = 0.0
                     else:
-                        full = chunk_clean
-                    # remember tail for next chunk's overlap
-                    if overlap_samples > 0:
-                        prev_tail = chunk_clean[-overlap_samples:] if len(chunk_clean) >= overlap_samples else chunk_clean.copy()
-                    # P2 — VAD: skip pure-silence chunks
-                    speech, ratio = has_speech(full)
-                    if not speech:
-                        with _state_lock:
-                            listening_now = state["listening"]
-                        if listening_now:
-                            broadcast("info", {"msg": f"…silence (VAD {ratio:.0%})"})
-                        continue
-                    try:
-                        audio_q.put_nowait(full)
-                    except queue.Full:
-                        pass
+                        if is_speaking:
+                            accumulated_chunks.append(block)
+                            silence_time += frame_duration
+                            speech_time += frame_duration
+                            
+                            # End of sentence (silence timeout) or maximum length reached
+                            if silence_time >= silence_threshold or speech_time >= max_speech_duration:
+                                chunk = np.concatenate(accumulated_chunks)
+                                speech_ok, _ = has_speech(chunk)
+                                if speech_ok:
+                                    # apply denoise only before sending to STT queue
+                                    chunk_clean = denoise_chunk(chunk)
+                                    try:
+                                        audio_q.put_nowait(chunk_clean)
+                                    except queue.Full:
+                                        pass
+                                accumulated_chunks.clear()
+                                is_speaking = False
+                                speech_time = 0.0
+                                silence_time = 0.0
+                        else:
+                            pre_roll_buffer.append(block)
+                            
         except Exception as e:
             broadcast("error", {"msg": f"Audio error: {e}"})
             with _state_lock:
                 state["listening"] = False
             broadcast("state", _public_state())
-            time.sleep(1)
 
 
 def stt_thread():
@@ -1470,10 +1541,9 @@ def stt_thread():
                 state["whisper_busy"] = False
             continue
         try:
-            save_wav(wav_path, chunk)
             whisper_lang = LANG_CODE.get(src, "auto")
             t0 = time.time()
-            text = transcribe(wav_path, whisper_lang)
+            text = transcribe(chunk, wav_path, whisper_lang)
             dt = time.time() - t0
             if text:
                 with _state_lock:
