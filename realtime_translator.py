@@ -188,13 +188,8 @@ WHISPER_THREADS  = 8          # M4 has 10 cores — leave 2 for UI/audio
 SUPPRESS_REGEX   = r"\b([dD]anke fürs zuschauen|[uU]ntertitel|[sS]ubtitles|[mM]usik|[aA]mara|字幕組)\b"
 HALLUC_TAGS      = ["[MUSIK]", "[musik]", "[ Music ]", "[音楽]", "[비명]",
                     "[박수]", "[拍手]", "(Lebhafte Musik)", "(Music)"]
-# Default whisper prompt primes German → meeting/tech context
-DEFAULT_WHISPER_PROMPT = (
-    "Ein Gespräch auf Deutsch in einem beruflichen Meeting. "
-    "Häufige Begriffe: API, Deployment, Sprint, Backlog, Stakeholder, "
-    "Meeting, Roadmap, Feature, Release, Review. "
-    "Sprecher: männlich und weiblich, formelle und informelle Redeweise."
-)
+# Default whisper prompt (generic fallback)
+DEFAULT_WHISPER_PROMPT = "A conversation."
 TRANSLATION_MEMORY_SIZE = 5   # P2 — last N segments fed to LLM as context (increase history size)
 
 # Precomputed constants & Compiled regex patterns for performance
@@ -262,6 +257,8 @@ state = {
     "concise_translation": False,      # whether to shorten translation to reduce latency
     "use_mlx_whisper": HAS_MLX_WHISPER,  # use in-process mlx_whisper if available
     "use_mlx_lm":      HAS_MLX_LM,       # use in-process mlx_lm if available (set to False to use Ollama by default)
+    "vad_silence_threshold": 0.8,      # silence after speech to trigger slice (seconds)
+    "vad_max_speech_duration": 5.0,    # max chunk length (seconds)
 }
 
 # P2 — 2-stage pipeline: audio_q → stt_thread → llm_q → llm_thread → SSE
@@ -378,6 +375,10 @@ def list_input_devices():
 
 
 def fetch_models():
+    with _state_lock:
+        use_mlx = state.get("use_mlx_lm", True)
+    if HAS_MLX_LM and use_mlx:
+        return list(MLX_MODEL_CATALOG.keys())
     try:
         with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=3) as r:
             data = json.loads(r.read().decode("utf-8"))
@@ -535,6 +536,8 @@ def get_system_resources():
 # MLX model catalog — backend for translate(). name → (size_mb, hf_repo, ram_mb).
 # ram_mb is approximate memory required to *load* the model in addition to OS overhead.
 MLX_MODEL_CATALOG = {
+    "gemma4:e2b-mlx": {"hf_repo": "mlx-community/gemma-3-4b-it-4bit", "size_mb": 2500, "ram_mb": 3500},
+    "gemma4:latest":  {"hf_repo": "mlx-community/gemma-3-4b-it-4bit", "size_mb": 2500, "ram_mb": 3500},
     "qwen2.5:0.5b":   {"hf_repo": "mlx-community/Qwen2.5-0.5B-Instruct-4bit", "size_mb": 400,  "ram_mb": 800},
     "gemma3:1b":      {"hf_repo": "mlx-community/gemma-3-1b-it-4bit",          "size_mb": 900,  "ram_mb": 1400},
     "qwen2.5:1.5b":   {"hf_repo": "mlx-community/Qwen2.5-1.5B-Instruct-4bit", "size_mb": 1100, "ram_mb": 1800},
@@ -634,24 +637,28 @@ def check_model_availability(model_name):
         "ram_ok": True,
         "warning": None,
     }
-    # Ollama
-    try:
-        with urllib.request.urlopen(f"{OLLAMA_URL}/api/show", timeout=3) as r:
-            r.read()
-    except urllib.error.HTTPError as e:
-        if e.code != 404:
+    with _state_lock:
+        use_mlx_lm = state.get("use_mlx_lm", True)
+    # Only hit Ollama if we're not strictly using MLX
+    if not (HAS_MLX_LM and use_mlx_lm):
+        # Ollama
+        try:
+            with urllib.request.urlopen(f"{OLLAMA_URL}/api/show", timeout=3) as r:
+                r.read()
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                pass
+        # Better: use /api/tags and /api/ps
+        try:
+            with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=3) as r:
+                data = json.loads(r.read().decode("utf-8"))
+                for m in data.get("models", []):
+                    if m.get("name") == model_name:
+                        result["ollama_installed"] = True
+                        result["ollama_size_mb"] = m.get("size", 0) // (1024 * 1024)
+                        break
+        except Exception:
             pass
-    # Better: use /api/tags and /api/ps
-    try:
-        with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=3) as r:
-            data = json.loads(r.read().decode("utf-8"))
-            for m in data.get("models", []):
-                if m.get("name") == model_name:
-                    result["ollama_installed"] = True
-                    result["ollama_size_mb"] = m.get("size", 0) // (1024 * 1024)
-                    break
-    except Exception:
-        pass
     # MLX catalog
     info = MLX_MODEL_CATALOG.get(model_name)
     if info:
@@ -750,7 +757,10 @@ def _ollama_error_message(e):
 def test_ollama():
     """Send a quick test prompt to verify Ollama is responding."""
     with _state_lock:
+        use_mlx_lm = state.get("use_mlx_lm", True)
         model = state["model"]
+    if HAS_MLX_LM and use_mlx_lm:
+        return True, 0.0, f"✓ MLX-LM is active for {model}"
     if not model:
         return False, 0.0, "No model selected"
     payload = {
@@ -875,15 +885,21 @@ def has_speech(audio_f32, sr=SAMPLERATE):
 # Prompts — P1: Thai-tuned, language-pair aware, glossary-aware
 # ============================================================
 
-# Hotwords appended to the Whisper --prompt (helps with proper nouns / tech terms)
-LANG_HOTWORDS = {
-    "German":   "API, Deployment, Sprint, Backlog, Stakeholder, Roadmap, Feature, Release, Review, OKR, KPI.",
-    "English":  "API, deployment, sprint, backlog, stakeholder, roadmap, feature, release, review, OKR, KPI.",
-    "Japanese": "API, デプロイ, スプリント, バックログ, ステークホルダー, ロードマップ.",
-    "French":   "API, déploiement, sprint, backlog, partie prenante, feuille de route.",
-    "Spanish":  "API, despliegue, sprint, backlog, parte interesada, hoja de ruta.",
-    "Chinese (Simplified)": "API, 部署, 冲刺, 待办, 利益相关者, 路线图.",
+# Clean, language-specific base prompts to guide transcription style
+WHISPER_BASE_PROMPTS = {
+    "German": "Ein Gespräch auf Deutsch.",
+    "English": "A conversation in English.",
+    "Thai": "การสนทนาภาษาไทย",
+    "Japanese": "日本語での会話。",
+    "French": "Une conversation en français.",
+    "Spanish": "Una conversación en español.",
+    "Chinese (Simplified)": "中文对话。",
+    "Chinese (Traditional)": "中文對話。",
+    "Korean": "한국어 대화.",
 }
+
+# Empty by default to avoid prompt leakage; users can add terms dynamically in the Glossary UI.
+LANG_HOTWORDS = {}
 
 
 def build_whisper_prompt(src_lang):
@@ -891,13 +907,10 @@ def build_whisper_prompt(src_lang):
     with _state_lock:
         custom = state.get("custom_prompt", "").strip()
         glossary = state.get("glossary", "").strip()
-    base = DEFAULT_WHISPER_PROMPT
-    hot = LANG_HOTWORDS.get(src_lang, "")
+    base = WHISPER_BASE_PROMPTS.get(src_lang, f"A conversation in {src_lang}.")
     pieces = [base]
-    if hot:
-        pieces.append("Schlüsselbegriffe: " + hot if src_lang == "German" else "Key terms: " + hot)
     if glossary:
-        pieces.append("Wichtige Namen/Begriffe: " + glossary)
+        pieces.append("Wichtige Namen/Begriffe: " + glossary if src_lang == "German" else "Important terms: " + glossary)
     if custom:
         pieces.append(custom)
     return " ".join(pieces)
@@ -919,6 +932,7 @@ LANG_PAIR_PROMPTS = {
         "Rules:\n"
         "- Output ONLY the Thai translation. No quotes, no 'Translation:', no language tags.\n"
         "- Translate the meaning of German words to natural Thai. Do NOT transliterate German words phonetically (except for proper names), and do NOT put the original German words in parentheses.\n"
+        "- Translate German relative time expressions accurately. Note that 'halb [hour]' means half past the previous hour (e.g., 'halb eins' is 12:30, 'halb zwei' is 1:30, 'halb drei' is 2:30). 'viertel vor [hour]' means quarter to (e.g., 'viertel vor eins' is 12:45). 'viertel nach [hour]' means quarter past (e.g., 'viertel nach eins' is 1:15).\n"
         "- Transliterate proper nouns phonetically (e.g. 'Herr Müller' → 'คุณมึลเลอร์'). "
         "  Never translate names.\n"
         "- Keep technical terms in English if commonly used in Thai (API, deployment, sprint, "
@@ -1036,10 +1050,73 @@ def validate_translation(src_text, tgt_text, src_lang, tgt_lang):
 # STT backends — P1 + P3: whisper.cpp (CLI) + mlx-whisper (in-process)
 # ============================================================
 
+def has_repetition_hallucination(text):
+    if not text:
+        return False
+    # clean punctuation
+    cleaned = re.sub(r'[^\w\s]', ' ', text).lower().split()
+    if len(cleaned) < 3:
+        return False
+
+    # 1. Consecutive word repetition, e.g. "word word word word"
+    consecutive_count = 1
+    max_consecutive = 1
+    for i in range(1, len(cleaned)):
+        if cleaned[i] == cleaned[i-1]:
+            consecutive_count += 1
+            if consecutive_count > max_consecutive:
+                max_consecutive = consecutive_count
+        else:
+            consecutive_count = 1
+    if max_consecutive >= 4 and len(cleaned) >= 5:
+        return True
+
+    # 2. Single word dominating the text
+    from collections import Counter
+    counts = Counter(cleaned)
+    most_common_word, count = counts.most_common(1)[0]
+    pct = count / len(cleaned)
+    if len(cleaned) >= 5:
+        if len(most_common_word) >= 3 and pct > 0.45:
+            return True
+        if pct > 0.6:
+            return True
+
+    # 3. Repeated phrase (2, 3, or 4 words)
+    for n in (2, 3, 4):
+        if len(cleaned) >= n * 3:
+            phrases = [" ".join(cleaned[i:i+n]) for i in range(len(cleaned) - n + 1)]
+            phrase_counts = Counter(phrases)
+            most_common_phrase, p_count = phrase_counts.most_common(1)[0]
+            if p_count >= 3:
+                coverage = (p_count * n) / len(cleaned)
+                if coverage > 0.5:
+                    return True
+
+    return False
+
+
+STANDALONE_HALLUCINATIONS = {
+    "you", "thank you", "thanks for watching", "thanks for watching!", 
+    "thank you for watching", "thank you for watching.",
+    "subtitles by", "untertitel", "danke fürs zuschauen", "danke fürs zuschauen.",
+    "vielen dank fürs zuschauen", "vielen dank fürs zuschauen."
+}
+
 def _strip_hallucinations(text):
     """Remove common hallucination tags / suppress-regex matches."""
     if not text:
         return text
+    
+    # Check standalone hallucinations
+    cleaned_lower = text.lower().strip().strip('.,!?')
+    if cleaned_lower in STANDALONE_HALLUCINATIONS:
+        return ""
+        
+    # Check repetition loop hallucinations
+    if has_repetition_hallucination(text):
+        return ""
+        
     for tag in HALLUC_TAGS:
         text = text.replace(tag, "")
     text = SUPPRESS_REGEX_RE.sub("", text)
@@ -1047,6 +1124,12 @@ def _strip_hallucinations(text):
         ln for ln in text.splitlines()
         if "Detected language" not in ln and "Whisper" not in ln
     )
+    
+    # Double check after stripping
+    cleaned_lower = text.lower().strip().strip('.,!?')
+    if cleaned_lower in STANDALONE_HALLUCINATIONS:
+        return ""
+        
     return text.strip()
 
 
@@ -1253,6 +1336,7 @@ def _ollama_request(path, payload):
 
 def _ollama_translate(text, model, system, use_memory, history):
     """Ollama /api/chat backend with connection pooling and memory."""
+    print(f"⚠️ Ollama Fallback / Translation using model: {model}", flush=True)
     messages = [{"role": "system", "content": system}]
     if use_memory:
         mem = _memory_block(history)
@@ -1289,6 +1373,7 @@ def _mlx_lm_translate(text, model, system, use_memory, history):
         use_mlx = state.get("use_mlx_lm", True)
     if not HAS_MLX_LM or not use_mlx:
         return None
+    print(f"⚙️ MLX Translation using model: {model}", flush=True)
     try:
         # Map ollama-style model name → HF repo if needed
         hf_model = _ollama_to_hf_repo(model)
@@ -1391,7 +1476,12 @@ def translate_text(text, model, src, tgt, history=None):
     try:
         result = _mlx_lm_translate(text, model, system, use_memory, history)
         if result is None:
-            result = _ollama_translate(text, model, system, use_memory, history)
+            with _state_lock:
+                use_mlx = state.get("use_mlx_lm", True)
+            if not use_mlx or not HAS_MLX_LM:
+                result = _ollama_translate(text, model, system, use_memory, history)
+            else:
+                result = "[Translate error: MLX-LM failed or was not loaded. Check mlx_error.log]"
     except Exception as e:
         result = f"[Translate error: {e}]"
 
@@ -1414,7 +1504,12 @@ def translate_text(text, model, src, tgt, history=None):
             # Try MLX-LM first on the retry path as well!
             retry = _mlx_lm_translate(text, model, strict_system, use_memory=False, history=[])
             if retry is None:
-                retry = _ollama_translate(text, model, strict_system, use_memory=False, history=[])
+                with _state_lock:
+                    use_mlx = state.get("use_mlx_lm", True)
+                if not use_mlx or not HAS_MLX_LM:
+                    retry = _ollama_translate(text, model, strict_system, use_memory=False, history=[])
+                else:
+                    retry = None
             
             if retry:
                 # Clean up retry text as well
@@ -1494,6 +1589,8 @@ def audio_thread():
                     with _state_lock:
                         if not state["listening"]:
                             break
+                        silence_threshold = state.get("vad_silence_threshold", 0.8)
+                        max_speech_duration = state.get("vad_max_speech_duration", 5.0)
                             
                     block, _ = stream.read(frame_samples)
                     
@@ -2233,6 +2330,16 @@ header,.toolbar,main,.stats-bar,footer{min-width:0}
       </label>
     </div>
     <div class="drawer-section">
+      <div class="drawer-label">VAD Silence Threshold (ตัวตรวจจับเสียงเงียบ): <span id="silence-val">0.8</span>s</div>
+      <input type="range" id="vad-silence-threshold" min="0.4" max="3.0" step="0.1" value="0.8" style="width:100%; margin: 8px 0; accent-color: var(--accent);">
+      <span class="hint">ระยะเวลาที่เงียบหลังจากพูดเพื่อตัดแบ่งประโยคไปแปล (แนะนำ: 1.0s - 1.5s เพื่อป้องกันการตัดเสียงสั้นเกินไปขณะพูดเว้นจังหวะ)</span>
+    </div>
+    <div class="drawer-section">
+      <div class="drawer-label">VAD Max Speech Duration (ความยาวประโยคสูงสุด): <span id="speech-val">5.0</span>s</div>
+      <input type="range" id="vad-max-speech-duration" min="2.0" max="25.0" step="0.5" value="5.0" style="width:100%; margin: 8px 0; accent-color: var(--accent);">
+      <span class="hint">ความยาวสูงสุดต่อหนึ่งประโยคก่อนบังคับส่งไปแปล (แนะนำ: 8.0s - 15.0s เพื่อช่วยแปลประโยคที่พูดยาวต่อเนื่องได้ดีขึ้น)</span>
+    </div>
+    <div class="drawer-section">
       <label class="drawer-checkbox-label">
         <input type="checkbox" id="use-mlx-whisper">
         <div>
@@ -2703,6 +2810,14 @@ header,.toolbar,main,.stats-bar,footer{min-width:0}
       $("concise-translation").checked = !!s.concise_translation;
       $("use-mlx-whisper").checked = s.use_mlx_whisper !== false;
       $("use-mlx-lm").checked = s.use_mlx_lm !== false;
+      
+      const silVal = s.vad_silence_threshold !== undefined ? s.vad_silence_threshold : 0.8;
+      $("vad-silence-threshold").value = silVal;
+      $("silence-val").textContent = silVal;
+      
+      const spVal = s.vad_max_speech_duration !== undefined ? s.vad_max_speech_duration : 5.0;
+      $("vad-max-speech-duration").value = spVal;
+      $("speech-val").textContent = spVal;
     } catch(e){}
   }
 
@@ -2829,6 +2944,8 @@ header,.toolbar,main,.stats-bar,footer{min-width:0}
   // Tune drawer wiring
   $("open-tune").addEventListener("click", () => { showDrawer(true); hydrateTune(); });
   $("tune-close").addEventListener("click", () => showDrawer(false));
+  $("vad-silence-threshold").addEventListener("input", e => { $("silence-val").textContent = parseFloat(e.target.value).toFixed(1); });
+  $("vad-max-speech-duration").addEventListener("input", e => { $("speech-val").textContent = parseFloat(e.target.value).toFixed(1); });
   $("save-tune").addEventListener("click", async () => {
     const hasDenoise = $("tog-denoise") ? $("tog-denoise").classList.contains("on") : true;
     const hasVad = $("tog-vad") ? $("tog-vad").classList.contains("on") : true;
@@ -2839,6 +2956,8 @@ header,.toolbar,main,.stats-bar,footer{min-width:0}
       concise_translation: $("concise-translation").checked,
       use_mlx_whisper: $("use-mlx-whisper").checked,
       use_mlx_lm: $("use-mlx-lm").checked,
+      vad_silence_threshold: parseFloat($("vad-silence-threshold").value),
+      vad_max_speech_duration: parseFloat($("vad-max-speech-duration").value),
       denoise: hasDenoise,
       vad_chunk: hasVad,
       use_memory: hasMemory,
@@ -3220,6 +3339,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if "concise_translation" in data:
                 state["concise_translation"] = bool(data["concise_translation"])
                 _translation_prompt_cache["key"] = None
+            if "vad_silence_threshold" in data:
+                state["vad_silence_threshold"] = float(data["vad_silence_threshold"])
+            if "vad_max_speech_duration" in data:
+                state["vad_max_speech_duration"] = float(data["vad_max_speech_duration"])
             if "glossary" in data:
                 state["glossary"] = str(data["glossary"])[:2000]
                 _translation_prompt_cache["key"] = None
@@ -3378,13 +3501,21 @@ def main():
     # warmup: pre-load model by sending a test prompt
     def warmup():
         time.sleep(0.6)
-        broadcast("info", {"msg": "Pre-loading Ollama model…"})
-        ok, elapsed, msg = test_ollama()
-        broadcast("ok" if ok else "error", {"msg": msg})
+        with _state_lock:
+            use_mlx_lm = state.get("use_mlx_lm", True)
+            use_mlx_whisper = state.get("use_mlx_whisper", True)
+
+        if HAS_MLX_LM and use_mlx_lm:
+            broadcast("info", {"msg": "Pre-loading MLX-LM model…"})
+            warmup_mlx_lm()
+        else:
+            broadcast("info", {"msg": "Pre-loading Ollama model…"})
+            ok, elapsed, msg = test_ollama()
+            broadcast("ok" if ok else "error", {"msg": msg})
         
         # Pre-load MLX models to eliminate first-sentence delay
-        warmup_mlx_whisper()
-        warmup_mlx_lm()
+        if HAS_MLX_WHISPER and use_mlx_whisper:
+            warmup_mlx_whisper()
         
     threading.Thread(target=warmup, daemon=True, name="warmup").start()
 
