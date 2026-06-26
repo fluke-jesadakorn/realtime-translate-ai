@@ -45,6 +45,8 @@ import wave
 import threading
 import subprocess
 import urllib.request
+import urllib.parse
+import http.client
 import http.server
 import webbrowser
 from datetime import datetime
@@ -751,24 +753,12 @@ def test_ollama():
     }
     start = time.time()
     try:
-        req = urllib.request.Request(
-            f"{OLLAMA_URL}/api/chat",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=60) as r:
-            data = json.loads(r.read().decode("utf-8"))
-            elapsed = time.time() - start
-            content = (data.get("message", {}).get("content") or "").strip()
-            return True, elapsed, f"✓ {model} responded in {elapsed:.1f}s · '{content[:30]}'"
-    except urllib.error.HTTPError as e:
-        short, hint = _ollama_error_message(e)
-        suffix = f" · {hint}" if hint else ""
-        return False, time.time() - start, f"✗ Ollama HTTP {e.code}: {short}{suffix}"
-    except urllib.error.URLError as e:
-        return False, time.time() - start, f"✗ Ollama unreachable: {e.reason}. Is `ollama serve` running?"
+        data = _ollama_request("/api/chat", payload)
+        elapsed = time.time() - start
+        content = (data.get("message", {}).get("content") or "").strip()
+        return True, elapsed, f"✓ {model} responded in {elapsed:.1f}s · '{content[:30]}'"
     except Exception as e:
-        return False, time.time() - start, f"✗ {type(e).__name__}: {e}"
+        return False, time.time() - start, f"✗ Ollama error: {e}"
 
 
 def test_capture():
@@ -1209,8 +1199,43 @@ def _memory_block(history):
     return "\n\n".join(lines)
 
 
+_ollama_conn = None
+
+
+def _ollama_request(path, payload):
+    global _ollama_conn
+    parsed = urllib.parse.urlparse(OLLAMA_URL)
+    netloc = parsed.netloc
+    
+    body = json.dumps(payload).encode("utf-8")
+    
+    for attempt in range(2):
+        if _ollama_conn is None:
+            _ollama_conn = http.client.HTTPConnection(netloc, timeout=120)
+        try:
+            _ollama_conn.request("POST", path, body, headers={"Content-Type": "application/json"})
+            resp = _ollama_conn.getresponse()
+            data = resp.read()
+            if resp.status != 200:
+                try:
+                    err_body = json.loads(data.decode("utf-8", errors="replace"))
+                    err_msg = err_body.get("error", f"HTTP {resp.status}")
+                except Exception:
+                    err_msg = f"HTTP {resp.status}"
+                raise RuntimeError(err_msg)
+            return json.loads(data.decode("utf-8"))
+        except (http.client.HTTPException, OSError) as e:
+            try:
+                _ollama_conn.close()
+            except Exception:
+                pass
+            _ollama_conn = None
+            if attempt == 1:
+                raise RuntimeError(f"{type(e).__name__}: {e}") from e
+
+
 def _ollama_translate(text, model, system, use_memory, history):
-    """Ollama /api/chat backend with optional streaming (P3) and memory."""
+    """Ollama /api/chat backend with connection pooling and memory."""
     messages = [{"role": "system", "content": system}]
     if use_memory:
         mem = _memory_block(history)
@@ -1231,26 +1256,13 @@ def _ollama_translate(text, model, system, use_memory, history):
             "stop": ["<end_of_turn>", "<eos>", "<|im_end|>", "<|endoftext|>"],
         },
     }
-    req = urllib.request.Request(
-        f"{OLLAMA_URL}/api/chat",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
     try:
-        with urllib.request.urlopen(req, timeout=120) as r:
-            data = json.loads(r.read().decode("utf-8"))
-            return (data.get("message", {}).get("content") or "").strip()
-    except urllib.error.HTTPError as e:
-        short, hint = _ollama_error_message(e)
-        # Surface as broadcast so the user sees it in the UI status pill / toast
-        msg = f"✗ Ollama {model}: {short}"
-        if hint:
-            msg += f" — {hint}"
-        broadcast("error", {"msg": msg})
+        data = _ollama_request("/api/chat", payload)
+        return (data.get("message", {}).get("content") or "").strip()
+    except Exception as e:
+        short = str(e)
+        broadcast("error", {"msg": f"✗ Ollama {model}: {short}"})
         raise RuntimeError(short) from e
-    except urllib.error.URLError as e:
-        broadcast("error", {"msg": f"✗ Ollama unreachable: {e.reason}. Is `ollama serve` running?"})
-        raise RuntimeError(f"Ollama unreachable: {e.reason}") from e
 
 
 def _mlx_lm_translate(text, model, system, use_memory, history):
@@ -3172,6 +3184,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 sse_clients.discard(client_q)
 
 
+def warmup_mlx_whisper():
+    if not HAS_MLX_WHISPER:
+        return
+    with _state_lock:
+        use_mlx = state.get("use_mlx_whisper", True)
+        wmodel = state.get("wmodel") or WHISPER_MODEL
+    if not use_mlx:
+        return
+    basename = os.path.basename(wmodel).replace("ggml-", "").replace(".bin", "")
+    mlx_repo = _whisper_basename_to_mlx_repo(basename)
+    local_path = _hf_repo_to_local_path(mlx_repo)
+    if local_path:
+        mlx_repo = local_path
+    broadcast("info", {"msg": f"Pre-loading MLX-Whisper model ({basename})…"})
+    try:
+        dummy = np.zeros(1600, dtype=np.float32)  # 100ms of silence
+        mlx_whisper.transcribe(dummy, path_or_hf_repo=mlx_repo)
+        _mlx_whisper_model["basename"] = basename
+        _mlx_whisper_model["hf_repo"] = mlx_repo
+        _mlx_whisper_model["loaded"] = True
+        broadcast("info", {"msg": f"✓ MLX-Whisper ({basename}) pre-loaded"})
+    except Exception as e:
+        broadcast("info", {"msg": f"MLX-Whisper pre-load failed: {e}"})
+
+
+def warmup_mlx_lm():
+    if not HAS_MLX_LM:
+        return
+    with _state_lock:
+        use_mlx = state.get("use_mlx_lm", True)
+        model = state.get("model")
+    if not use_mlx or not model:
+        return
+    hf_model = _ollama_to_hf_repo(model)
+    broadcast("info", {"msg": f"Pre-loading MLX-LM model ({model})…"})
+    try:
+        load_target = _hf_repo_to_local_path(hf_model) or hf_model
+        _mlx_lm_cache["model_obj"], _mlx_lm_cache["tokenizer"] = mlx_lm_load(load_target)
+        _mlx_lm_cache["name"] = hf_model
+        _mlx_lm_cache["loaded"] = True
+        broadcast("info", {"msg": f"✓ MLX-LM ({model}) pre-loaded"})
+    except Exception as e:
+        broadcast("info", {"msg": f"MLX-LM pre-load failed: {e}"})
+
+
 def main():
     # default model — prefer accuracy over speed for first run
     # Priority order: gemma > llama3 > mistral > qwen > anything else
@@ -3225,6 +3282,11 @@ def main():
         broadcast("info", {"msg": "Pre-loading Ollama model…"})
         ok, elapsed, msg = test_ollama()
         broadcast("ok" if ok else "error", {"msg": msg})
+        
+        # Pre-load MLX models to eliminate first-sentence delay
+        warmup_mlx_whisper()
+        warmup_mlx_lm()
+        
     threading.Thread(target=warmup, daemon=True, name="warmup").start()
 
     # try to bind to fixed port; give up with clear message if taken
