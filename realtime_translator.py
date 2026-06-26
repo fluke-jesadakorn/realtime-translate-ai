@@ -1837,7 +1837,7 @@ HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#0E0E13">
-<title>Foundry — Realtime Voice Intelligence · The Factory Group</title>
+<title>The Factory Group — Realtime Voice Intelligence</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23E11D48'/%3E%3Cpath d='M10 7v18M10 7h11M10 16h8' stroke='white' stroke-width='3' stroke-linecap='square' fill='none'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -2184,8 +2184,8 @@ header,.toolbar,main,.stats-bar,footer{min-width:0}
         </svg>
       </div>
       <div class="brand-text">
-        <div class="brand-name">Foundry</div>
-        <div class="brand-tag">Realtime Voice Intelligence · <b>The Factory Group</b></div>
+        <div class="brand-name">The Factory Group</div>
+        <div class="brand-tag">Realtime Voice Intelligence</div>
       </div>
     </div>
     <div class="header-spacer"></div>
@@ -2305,9 +2305,7 @@ header,.toolbar,main,.stats-bar,footer{min-width:0}
   <footer>
     <div class="backend-row" id="backend-chips"></div>
     <div class="footer-meta">
-      <span><b>Foundry</b> v3</span>
-      <span class="sep">·</span>
-      <span>The Factory Group</span>
+      <span><b>The Factory Group</b> v3</span>
       <span class="sep">·</span>
       <span id="count">0 segments</span>
     </div>
@@ -2317,7 +2315,7 @@ header,.toolbar,main,.stats-bar,footer{min-width:0}
 <div class="modal-bg" id="modal-bg">
   <div class="modal">
     <div class="modal-head">
-      <h2>Models<small>The Factory Group · Foundry</small></h2>
+      <h2>Models<small>The Factory Group</small></h2>
       <button class="modal-close" id="modal-close">&times;</button>
     </div>
     <div class="modal-tabs">
@@ -2331,7 +2329,7 @@ header,.toolbar,main,.stats-bar,footer{min-width:0}
 
 <div class="drawer" id="tune-drawer">
   <div class="drawer-head">
-    <h3>Tune Translation<small>The Factory Group · Foundry</small></h3>
+    <h3>Tune Translation<small>The Factory Group</small></h3>
     <button class="modal-close" id="tune-close">&times;</button>
   </div>
   <div class="drawer-body">
@@ -3050,7 +3048,7 @@ header,.toolbar,main,.stats-bar,footer{min-width:0}
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "foundry_transcript_"+new Date().toISOString().replace(/[:.]/g,"-").slice(0,19)+".txt";
+    a.download = "the_factory_group_transcript_"+new Date().toISOString().replace(/[:.]/g,"-").slice(0,19)+".txt";
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
     toast("💾 Saved "+a.download, "ok");
@@ -3572,7 +3570,7 @@ def main():
         sys.exit(1)
     port = PORT
     url = f"http://localhost:{port}/"
-    print(f"\n⚡ Foundry — Realtime Voice Intelligence · The Factory Group")
+    print(f"\n⚡ The Factory Group — Realtime Voice Intelligence")
     print(f"   running at {url}")
     print("   BlackHole 2ch → VAD + denoise → whisper (large-v3-turbo) → Ollama/MLX")
     print("   Press Ctrl+C to stop.\n")
