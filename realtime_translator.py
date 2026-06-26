@@ -1224,7 +1224,7 @@ def _ollama_request(path, payload):
     
     for attempt in range(2):
         if _ollama_conn is None:
-            _ollama_conn = http.client.HTTPConnection(netloc, timeout=120)
+            _ollama_conn = http.client.HTTPConnection(netloc, timeout=8)
         try:
             _ollama_conn.request("POST", path, body, headers={"Content-Type": "application/json"})
             resp = _ollama_conn.getresponse()
@@ -1431,7 +1431,7 @@ def audio_thread():
     frame_samples = int(SAMPLERATE * frame_duration)
     
     # Configuration parameters
-    max_speech_duration = 10.0  # seconds (max chunk length)
+    max_speech_duration = 5.0  # seconds (max chunk length)
     silence_threshold = 0.8  # seconds (silence after speech to trigger slice)
     
     pre_roll_buffer = deque(maxlen=5)  # store last 0.5s of silence
@@ -1624,11 +1624,45 @@ def stt_thread():
 
 def llm_thread():
     """P2 — Stage 2: pull transcribed text → translate → broadcast.
-    Runs concurrently with stt_thread so back-to-back chunks pipeline properly."""
+    Runs concurrently with stt_thread so back-to-back chunks pipeline properly.
+    Includes backlog/overflow merging to prevent delay accumulation when LLM is slow."""
     while True:
         item = llm_q.get()
         if item is None:
             break
+            
+        # Check for backlog/overflow in the queue to combine them
+        backlog_items = []
+        while not llm_q.empty():
+            try:
+                next_item = llm_q.get_nowait()
+                if next_item is None:
+                    # Put it back to signal shutdown and stop combining
+                    llm_q.put_nowait(None)
+                    break
+                backlog_items.append(next_item)
+            except queue.Empty:
+                break
+                
+        if backlog_items:
+            # Combine backlog items with the current item to catch up instantly
+            combined_src = item["src"]
+            for b_item in backlog_items:
+                if not combined_src.endswith((" ", ".", "?", "!", "।")) and not b_item["src"].startswith(" "):
+                    combined_src += " "
+                combined_src += b_item["src"]
+                
+            latest_item = backlog_items[-1]
+            item = {
+                "src": combined_src,
+                "src_lang": latest_item["src_lang"],
+                "tgt_lang": latest_item["tgt_lang"],
+                "model": latest_item["model"],
+                "stt_time": sum(x.get("stt_time", 0) for x in [item] + backlog_items) / (1 + len(backlog_items)),
+                "ts": latest_item["ts"]
+            }
+            broadcast("info", {"msg": f"⚡ Catching up: merged {1 + len(backlog_items)} overflow segments"})
+            
         with _state_lock:
             state["llm_busy"] = True
         try:
