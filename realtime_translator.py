@@ -1431,7 +1431,7 @@ def audio_thread():
     frame_samples = int(SAMPLERATE * frame_duration)
     
     # Configuration parameters
-    max_speech_duration = 5.0  # seconds (max chunk length)
+    max_speech_duration = 10.0  # seconds (max chunk length)
     silence_threshold = 0.8  # seconds (silence after speech to trigger slice)
     
     pre_roll_buffer = deque(maxlen=5)  # store last 0.5s of silence
@@ -1525,6 +1525,21 @@ def audio_thread():
                         accumulated_chunks.append(block)
                         speech_time += frame_duration
                         silence_time = 0.0
+                        
+                        # Force slice even during active speech if maximum length is reached
+                        if speech_time >= max_speech_duration:
+                            chunk = np.concatenate(accumulated_chunks)
+                            speech_ok, _ = has_speech(chunk)
+                            if speech_ok:
+                                chunk_clean = denoise_chunk(chunk)
+                                try:
+                                    audio_q.put_nowait(chunk_clean)
+                                except queue.Full:
+                                    pass
+                            accumulated_chunks.clear()
+                            is_speaking = False
+                            speech_time = 0.0
+                            silence_time = 0.0
                     else:
                         if is_speaking:
                             accumulated_chunks.append(block)
