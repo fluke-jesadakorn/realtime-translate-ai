@@ -1329,6 +1329,14 @@ def _mlx_lm_translate(text, model, system, use_memory, history):
         )
         return (out or "").strip()
     except Exception as e:
+        import traceback
+        try:
+            with open(os.path.join(SCRIPT_DIR, "mlx_error.log"), "a", encoding="utf-8") as f:
+                f.write(f"--- MLX-LM Exception at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+                traceback.print_exc(file=f)
+                f.write("\n")
+        except Exception:
+            pass
         broadcast("info", {"msg": f"MLX-LM unavailable ({type(e).__name__}: {str(e)[:80]}), falling back to Ollama"})
         _mlx_lm_cache["loaded"] = False
         return None
