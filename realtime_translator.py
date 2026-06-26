@@ -1856,6 +1856,7 @@ HTML = r"""<!DOCTYPE html>
   --ease:cubic-bezier(.16,1,.3,1);
   --t-fast:.15s var(--ease);--t-med:.25s var(--ease);--t-slow:.4s var(--ease);
   --r-sm:6px;--r-md:10px;--r-lg:14px;--r-xl:20px;
+  --entry-font-size:16px;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
@@ -1938,8 +1939,8 @@ main{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--bd-1);m
 .entry-meta .ts{color:var(--tx-3);font-weight:600}
 .entry-meta .dot{width:3px;height:3px;border-radius:50%;background:var(--tx-4)}
 .entry-meta .lat{color:var(--ok);font-weight:600}
-.entry-text{font-size:15px;line-height:1.55;color:var(--tx);white-space:pre-wrap;word-wrap:break-word}
-.pane.tgt .entry-text{font-size:16px;font-weight:500}
+.entry-text{font-size:calc(var(--entry-font-size) - 1px);line-height:1.55;color:var(--tx);white-space:pre-wrap;word-wrap:break-word}
+.pane.tgt .entry-text{font-size:var(--entry-font-size);font-weight:500}
 .empty{display:flex;flex-direction:column;align-items:center;justify-content:center;flex:1;color:var(--tx-3);text-align:center;padding:40px 20px}
 .empty-icon{width:48px;height:48px;color:var(--tx-4);margin-bottom:14px;opacity:.5;stroke-width:1.2}
 .empty-title{font-size:14px;color:var(--tx-2);font-weight:600;margin-bottom:4px;letter-spacing:.2px}
@@ -2362,6 +2363,11 @@ header,.toolbar,main,.stats-bar,footer{min-width:0}
       <span class="hint">ความยาวสูงสุดต่อหนึ่งประโยคก่อนบังคับส่งไปแปล (แนะนำ: 8.0s - 15.0s เพื่อช่วยแปลประโยคที่พูดยาวต่อเนื่องได้ดีขึ้น)</span>
     </div>
     <div class="drawer-section">
+      <div class="drawer-label">Font Size (ขนาดตัวอักษร): <span id="font-size-val">16</span>px</div>
+      <input type="range" id="font-size-slider" min="12" max="36" step="1" value="16" style="width:100%; margin: 8px 0; accent-color: var(--accent);">
+      <span class="hint">ปรับขนาดตัวอักษรของคำแปลและข้อความถอดเสียง (แนะนำ: 14px - 24px)</span>
+    </div>
+    <div class="drawer-section">
       <label class="drawer-checkbox-label">
         <input type="checkbox" id="use-mlx-whisper">
         <div>
@@ -2396,6 +2402,10 @@ header,.toolbar,main,.stats-bar,footer{min-width:0}
 (function(){
   "use strict";
   const $ = (id) => document.getElementById(id);
+  
+  // Load saved font size on startup
+  const savedFontSize = localStorage.getItem("entry-font-size") || "16";
+  document.documentElement.style.setProperty("--entry-font-size", savedFontSize + "px");
   const LANGS = ["English","Thai","Japanese","Chinese (Simplified)","Chinese (Traditional)","Korean","French","German","Spanish","Portuguese","Russian","Italian","Vietnamese","Indonesian","Arabic","Hindi","Burmese","Lao","Khmer","Malay","Turkish","Dutch","Polish","Swedish"];
   const WHISPER_CATALOG = [
     {name:"tiny",           size:75,    desc:"Fastest — low accuracy"},
@@ -2840,6 +2850,10 @@ header,.toolbar,main,.stats-bar,footer{min-width:0}
       const spVal = s.vad_max_speech_duration !== undefined ? s.vad_max_speech_duration : 5.0;
       $("vad-max-speech-duration").value = spVal;
       $("speech-val").textContent = spVal;
+      
+      const fsVal = localStorage.getItem("entry-font-size") || "16";
+      $("font-size-slider").value = fsVal;
+      $("font-size-val").textContent = fsVal;
     } catch(e){}
   }
 
@@ -2968,6 +2982,12 @@ header,.toolbar,main,.stats-bar,footer{min-width:0}
   $("tune-close").addEventListener("click", () => showDrawer(false));
   $("vad-silence-threshold").addEventListener("input", e => { $("silence-val").textContent = parseFloat(e.target.value).toFixed(1); });
   $("vad-max-speech-duration").addEventListener("input", e => { $("speech-val").textContent = parseFloat(e.target.value).toFixed(1); });
+  $("font-size-slider").addEventListener("input", e => {
+    const val = e.target.value;
+    $("font-size-val").textContent = val;
+    document.documentElement.style.setProperty("--entry-font-size", val + "px");
+    localStorage.setItem("entry-font-size", val);
+  });
   $("save-tune").addEventListener("click", async () => {
     const hasDenoise = $("tog-denoise") ? $("tog-denoise").classList.contains("on") : true;
     const hasVad = $("tog-vad") ? $("tog-vad").classList.contains("on") : true;
