@@ -842,9 +842,17 @@ def denoise_chunk(audio_f32, sr=SAMPLERATE):
 
 def has_speech(audio_f32, sr=SAMPLERATE):
     """Use webrtcvad to detect if chunk contains enough speech.
-    Returns (has_speech: bool, speech_ratio: float). Always-on (no toggle)."""
+    Also falls back to audio energy (volume) to allow music/singing chunks.
+    Returns (has_speech: bool, speech_ratio: float)."""
     if audio_f32 is None or len(audio_f32) < sr // 4:
         return False, 0.0
+    
+    # Calculate RMS volume of the entire chunk
+    vol = float(np.linalg.norm(audio_f32) / np.sqrt(len(audio_f32)))
+    # If the average volume is high (e.g. music/singing/continuous speech), allow it
+    if vol > 0.005:
+        return True, 1.0
+        
     try:
         vad = _get_vad()
         # webrtcvad needs 16-bit PCM at 8k/16k/32k/48k, frame sizes 10/20/30 ms
@@ -1255,7 +1263,7 @@ def _ollama_translate(text, model, system, use_memory, history):
         "options": {
             "temperature": 0.0,
             "seed": 42,
-            "num_predict": 256,
+            "num_predict": 1024,
             "repeat_penalty": 1.2,
             "top_p": 0.9,
             "stop": ["<end_of_turn>", "<eos>", "<|im_end|>", "<|endoftext|>"],
@@ -1311,7 +1319,7 @@ def _mlx_lm_translate(text, model, system, use_memory, history):
             cache["model_obj"],
             cache["tokenizer"],
             prompt=prompt,
-            max_tokens=256,
+            max_tokens=1024,
             # Note: mlx_lm 0.31+ removed `temp=` kwarg. Greedy (no sampler)
             # is deterministic and matches Ollama's temperature=0.0 behavior.
         )
@@ -1474,14 +1482,17 @@ def audio_thread():
                             break
                             
                     block, _ = stream.read(frame_samples)
-                    is_speech = is_frame_speech(vad, block)
                     
                     # Level meter calculation (updated smoothly every 100ms)
                     vol = float(np.linalg.norm(block) / np.sqrt(len(block)))
-                    vol = min(1.0, vol * 5)
+                    
+                    # Check if VAD detects speech OR if the volume is above a noise floor (e.g. music/singing)
+                    is_speech = is_frame_speech(vad, block) or (vol > 0.003)
+                    
+                    vol_ui = min(1.0, vol * 5)
                     with _state_lock:
-                        state["level"] = vol
-                    broadcast("level", {"v": vol})
+                        state["level"] = vol_ui
+                    broadcast("level", {"v": vol_ui})
                     
                     # Detect silent-input bug: system audio routing issue
                     raw_peak = float(np.abs(block).max())
