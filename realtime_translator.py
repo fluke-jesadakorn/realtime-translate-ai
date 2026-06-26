@@ -260,8 +260,8 @@ state = {
     "glossary":      "",               # user-defined terms: "Krakenversicherung=Krankenversicherung, M2024=Meeting 2024"
     "custom_prompt": "",               # optional full override of translation system prompt
     "concise_translation": False,      # whether to shorten translation to reduce latency
-    "use_mlx_whisper": False,          # use in-process mlx_whisper if available
-    "use_mlx_lm":      False,          # use in-process mlx_lm if available (set to False to use Ollama by default)
+    "use_mlx_whisper": HAS_MLX_WHISPER,  # use in-process mlx_whisper if available
+    "use_mlx_lm":      HAS_MLX_LM,       # use in-process mlx_lm if available (set to False to use Ollama by default)
 }
 
 # P2 — 2-stage pipeline: audio_q → stt_thread → llm_q → llm_thread → SSE
@@ -1333,6 +1333,7 @@ def _mlx_lm_translate(text, model, system, use_memory, history):
 
 # Map Ollama model names → MLX-compatible HF repos for in-process translation
 _OLLAMA_TO_HF = {
+    "gemma4:e2b-mlx":    "mlx-community/gemma-3-4b-it-4bit",
     "gemma4:latest":     "mlx-community/gemma-3-4b-it-4bit",
     "gemma3:4b":         "mlx-community/gemma-3-4b-it-4bit",
     "gemma3:1b":         "mlx-community/gemma-3-1b-it-4bit",
@@ -1341,6 +1342,7 @@ _OLLAMA_TO_HF = {
     "llama3.1:8b":       "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
     "llama3.2:3b":       "mlx-community/Llama-3.2-3B-Instruct-4bit",
     "llama3.2:1b":       "mlx-community/Llama-3.2-1B-Instruct-4bit",
+    "qwen3.5:4b-mlx":    "mlx-community/Qwen2.5-3B-Instruct-4bit",
     "qwen2.5:7b":        "mlx-community/Qwen2.5-7B-Instruct-4bit",
     "qwen2.5:3b":        "mlx-community/Qwen2.5-3B-Instruct-4bit",
     "qwen2.5:1.5b":      "mlx-community/Qwen2.5-1.5B-Instruct-4bit",
