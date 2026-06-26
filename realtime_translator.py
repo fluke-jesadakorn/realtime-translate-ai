@@ -1338,12 +1338,23 @@ def _ollama_translate(text, model, system, use_memory, history):
     """Ollama /api/chat backend with connection pooling and memory."""
     print(f"⚠️ Ollama Fallback / Translation using model: {model}", flush=True)
     messages = [{"role": "system", "content": system}]
+    user_msg = text
     if use_memory:
         mem = _memory_block(history)
+        prompt_parts = []
         if mem:
-            messages.append({"role": "system", "content":
-                "Previous translations in this conversation (preserve terminology and pronouns):\n" + mem})
-    messages.append({"role": "user", "content": text})
+            prompt_parts.append(f"Previous translations (preserve terminology and tone):\n{mem}")
+        
+        context_srcs = [h["src"] for h in history[-2:] if h.get("src")]
+        if context_srcs:
+            context_line = " ".join(context_srcs)
+            prompt_parts.append(f"Context (previous sentences spoken): {context_line}")
+            prompt_parts.append(f"Translate ONLY this current sentence: {text}")
+        else:
+            prompt_parts.append(f"Translate: {text}")
+            
+        user_msg = "\n\n".join(prompt_parts)
+    messages.append({"role": "user", "content": user_msg})
     payload = {
         "model": model,
         "messages": messages,
@@ -1391,8 +1402,19 @@ def _mlx_lm_translate(text, model, system, use_memory, history):
         user_msg = text
         if use_memory:
             mem = _memory_block(history)
+            prompt_parts = []
             if mem:
-                user_msg = f"Previous translations (preserve terminology and tone):\n{mem}\n\nNow translate:\n{text}"
+                prompt_parts.append(f"Previous translations (preserve terminology and tone):\n{mem}")
+            
+            context_srcs = [h["src"] for h in history[-2:] if h.get("src")]
+            if context_srcs:
+                context_line = " ".join(context_srcs)
+                prompt_parts.append(f"Context (previous sentences spoken): {context_line}")
+                prompt_parts.append(f"Translate ONLY this current sentence: {text}")
+            else:
+                prompt_parts.append(f"Translate: {text}")
+                
+            user_msg = "\n\n".join(prompt_parts)
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user_msg},
