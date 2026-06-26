@@ -1224,7 +1224,7 @@ def _ollama_request(path, payload):
     
     for attempt in range(2):
         if _ollama_conn is None:
-            _ollama_conn = http.client.HTTPConnection(netloc, timeout=8)
+            _ollama_conn = http.client.HTTPConnection(netloc, timeout=10)
         try:
             _ollama_conn.request("POST", path, body, headers={"Content-Type": "application/json"})
             resp = _ollama_conn.getresponse()
@@ -1243,7 +1243,8 @@ def _ollama_request(path, payload):
             except Exception:
                 pass
             _ollama_conn = None
-            if attempt == 1:
+            is_timeout = isinstance(e, TimeoutError) or "timed out" in str(e).lower()
+            if attempt == 1 or is_timeout:
                 raise RuntimeError(f"{type(e).__name__}: {e}") from e
 
 
