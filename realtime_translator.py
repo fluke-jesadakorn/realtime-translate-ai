@@ -1120,6 +1120,9 @@ def transcribe_mlx(audio_input, lang, prompt):
     Falls back to None if not available; caller should fall back to CLI.
     `audio_input` can be a path to a wav file or a numpy float32 array.
     """
+    if isinstance(audio_input, np.ndarray):
+        audio_input = audio_input.flatten()
+
     with _state_lock:
         use_mlx = state.get("use_mlx_whisper", True)
     if not HAS_MLX_WHISPER or not use_mlx:
