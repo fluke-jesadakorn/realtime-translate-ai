@@ -197,6 +197,14 @@ DEFAULT_WHISPER_PROMPT = (
 )
 TRANSLATION_MEMORY_SIZE = 5   # P2 — last N segments fed to LLM as context (increase history size)
 
+# Precomputed constants & Compiled regex patterns for performance
+SUBFRAME_SAMPLES = int(SAMPLERATE * 0.030)  # 480 samples
+SUBFRAME_BYTES = SUBFRAME_SAMPLES * 2       # 960 bytes
+VAD_FRAME_BYTES = int(SAMPLERATE * VAD_FRAME_MS / 1000) * 2  # 960 bytes
+
+SUPPRESS_REGEX_RE = re.compile(SUPPRESS_REGEX)
+THAI_STUTTER_RE = re.compile(r'([ะัาิีึืุู็่้๊๋์ๆ])\1+')
+
 # auto-detect whisper model in several common locations
 _WHISPER_CANDIDATES = [
     os.path.expanduser("~/whisper-models/ggml-base.bin"),
@@ -800,14 +808,12 @@ def is_frame_speech(vad, frame_f32, sr=SAMPLERATE):
     Returns True if at least 30% of the sub-frames contain speech."""
     try:
         pcm16 = (np.clip(frame_f32, -1, 1) * 32767).astype(np.int16).tobytes()
-        subframe_samples = int(sr * 0.030)  # 30 ms = 480 samples
-        subframe_bytes = subframe_samples * 2  # 16-bit PCM has 2 bytes per sample = 960 bytes
-        n_subframes = len(pcm16) // subframe_bytes
+        n_subframes = len(pcm16) // SUBFRAME_BYTES
         if n_subframes == 0:
             return False
         speech_count = 0
         for i in range(n_subframes):
-            subframe = pcm16[i * subframe_bytes:(i + 1) * subframe_bytes]
+            subframe = pcm16[i * SUBFRAME_BYTES:(i + 1) * SUBFRAME_BYTES]
             if vad.is_speech(subframe, sr):
                 speech_count += 1
         return (speech_count / n_subframes) >= 0.30
@@ -843,13 +849,12 @@ def has_speech(audio_f32, sr=SAMPLERATE):
         vad = _get_vad()
         # webrtcvad needs 16-bit PCM at 8k/16k/32k/48k, frame sizes 10/20/30 ms
         pcm16 = (np.clip(audio_f32, -1, 1) * 32767).astype(np.int16).tobytes()
-        frame_bytes = int(sr * VAD_FRAME_MS / 1000) * 2  # 2 bytes per sample
-        if len(pcm16) < frame_bytes * 3:
+        if len(pcm16) < VAD_FRAME_BYTES * 3:
             return False, 0.0
-        n_frames = len(pcm16) // frame_bytes
+        n_frames = len(pcm16) // VAD_FRAME_BYTES
         speech_frames = 0
         for i in range(n_frames):
-            frame = pcm16[i * frame_bytes:(i + 1) * frame_bytes]
+            frame = pcm16[i * VAD_FRAME_BYTES:(i + 1) * VAD_FRAME_BYTES]
             if vad.is_speech(frame, sr):
                 speech_frames += 1
         ratio = speech_frames / max(1, n_frames)
@@ -1029,7 +1034,7 @@ def _strip_hallucinations(text):
         return text
     for tag in HALLUC_TAGS:
         text = text.replace(tag, "")
-    text = re.sub(SUPPRESS_REGEX, "", text)
+    text = SUPPRESS_REGEX_RE.sub("", text)
     text = "\n".join(
         ln for ln in text.splitlines()
         if "Detected language" not in ln and "Whisper" not in ln
@@ -1374,7 +1379,7 @@ def translate_text(text, model, src, tgt, history=None):
             result = result.replace(token, "")
         result = result.strip()
         if tgt == "Thai":
-            result = re.sub(r'([ะัาิีึืุู็่้๊๋์ๆ])\1+', r'\1', result)
+            result = THAI_STUTTER_RE.sub(r'\1', result)
 
     # P2 — validate, retry once with stricter prompt
     ok, reason = validate_translation(text, result, src, tgt)
@@ -1384,14 +1389,18 @@ def translate_text(text, model, src, tgt, history=None):
             "Output ONLY the translation with no preamble, no explanation, no quotes."
         )
         try:
-            retry = _ollama_translate(text, model, strict_system, use_memory=False, history=[])
+            # Try MLX-LM first on the retry path as well!
+            retry = _mlx_lm_translate(text, model, strict_system, use_memory=False, history=[])
+            if retry is None:
+                retry = _ollama_translate(text, model, strict_system, use_memory=False, history=[])
+            
             if retry:
                 # Clean up retry text as well
                 for token in ["<end_of_turn>", "<eos>", "<|im_end|>", "<|endoftext|>"]:
                     retry = retry.replace(token, "")
                 retry = retry.strip()
                 if tgt == "Thai":
-                    retry = re.sub(r'([ะัาิีึืุู็่้๊๋์ๆ])\1+', r'\1', retry)
+                    retry = THAI_STUTTER_RE.sub(r'\1', retry)
                 
                 ok2, _ = validate_translation(text, retry, src, tgt)
                 if ok2:
